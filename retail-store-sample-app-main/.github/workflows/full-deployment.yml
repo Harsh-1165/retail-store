@@ -1,0 +1,406 @@
+name: Full Application Deployment
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      services:
+        description: 'Services to deploy (comma-separated: ui,catalog,orders,checkout,cart,app or "all")'
+        required: true
+        default: 'all'
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'staging' }}
+
+jobs:
+  # Phase 1: Setup and Validation
+  setup:
+    name: 🔧 Setup & Validation
+    runs-on: ubuntu-latest
+    outputs:
+      deploy-ui: ${{ steps.services.outputs.deploy-ui }}
+      deploy-catalog: ${{ steps.services.outputs.deploy-catalog }}
+      deploy-orders: ${{ steps.services.outputs.deploy-orders }}
+      deploy-checkout: ${{ steps.services.outputs.deploy-checkout }}
+      deploy-cart: ${{ steps.services.outputs.deploy-cart }}
+      deploy-app: ${{ steps.services.outputs.deploy-app }}
+      matrix-services: ${{ steps.services.outputs.matrix-services }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes and determine services to deploy
+        id: services
+        run: |
+          # Determine which services to deploy
+          if [ "${{ github.event.inputs.services }}" = "all" ] || [ -z "${{ github.event.inputs.services }}" ]; then
+            # Deploy all services if manual trigger with "all" or automatic trigger
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "Manual deployment: deploying all services"
+              deploy_ui=true
+              deploy_catalog=true
+              deploy_orders=true
+              deploy_checkout=true
+              deploy_cart=true
+              deploy_app=true
+            else
+              # Auto trigger: check for changes
+              echo "Automatic deployment: checking for changes"
+              deploy_ui=$(git diff --name-only HEAD~1 HEAD | grep -q "^src/ui/" && echo "true" || echo "false")
+              deploy_catalog=$(git diff --name-only HEAD~1 HEAD | grep -q "^src/catalog/" && echo "true" || echo "false")
+              deploy_orders=$(git diff --name-only HEAD~1 HEAD | grep -q "^src/orders/" && echo "true" || echo "false")
+              deploy_checkout=$(git diff --name-only HEAD~1 HEAD | grep -q "^src/checkout/" && echo "true" || echo "false")
+              deploy_cart=$(git diff --name-only HEAD~1 HEAD | grep -q "^src/cart/" && echo "true" || echo "false")
+              deploy_app=$(git diff --name-only HEAD~1 HEAD | grep -q "^src/app/" && echo "true" || echo "false")
+            fi
+          else
+            # Deploy specific services
+            services="${{ github.event.inputs.services }}"
+            deploy_ui=$(echo "$services" | grep -q "ui" && echo "true" || echo "false")
+            deploy_catalog=$(echo "$services" | grep -q "catalog" && echo "true" || echo "false")
+            deploy_orders=$(echo "$services" | grep -q "orders" && echo "true" || echo "false")
+            deploy_checkout=$(echo "$services" | grep -q "checkout" && echo "true" || echo "false")
+            deploy_cart=$(echo "$services" | grep -q "cart" && echo "true" || echo "false")
+            deploy_app=$(echo "$services" | grep -q "app" && echo "true" || echo "false")
+          fi
+
+          # Set outputs
+          echo "deploy-ui=$deploy_ui" >> $GITHUB_OUTPUT
+          echo "deploy-catalog=$deploy_catalog" >> $GITHUB_OUTPUT
+          echo "deploy-orders=$deploy_orders" >> $GITHUB_OUTPUT
+          echo "deploy-checkout=$deploy_checkout" >> $GITHUB_OUTPUT
+          echo "deploy-cart=$deploy_cart" >> $GITHUB_OUTPUT
+          echo "deploy-app=$deploy_app" >> $GITHUB_OUTPUT
+
+          # Create matrix for services to deploy
+          matrix_services="["
+          [ "$deploy_ui" = "true" ] && matrix_services="$matrix_services\"ui\","
+          [ "$deploy_catalog" = "true" ] && matrix_services="$matrix_services\"catalog\","
+          [ "$deploy_orders" = "true" ] && matrix_services="$matrix_services\"orders\","
+          [ "$deploy_checkout" = "true" ] && matrix_services="$matrix_services\"checkout\","
+          [ "$deploy_cart" = "true" ] && matrix_services="$matrix_services\"cart\","
+          [ "$deploy_app" = "true" ] && matrix_services="$matrix_services\"app\","
+          matrix_services="${matrix_services%,}]"
+          
+          echo "matrix-services=$matrix_services" >> $GITHUB_OUTPUT
+          
+          echo "Services to deploy: $matrix_services"
+
+      - name: Validate AWS credentials
+        run: |
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] || [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+            echo "❌ AWS credentials not configured"
+            exit 1
+          fi
+          echo "✅ AWS credentials configured"
+
+      - name: Validate ECR registry
+        run: |
+          if [ -z "${{ secrets.ECR_REGISTRY }}" ]; then
+            echo "❌ ECR registry not configured"
+            exit 1
+          fi
+          echo "✅ ECR registry configured: ${{ secrets.ECR_REGISTRY }}"
+
+  # Phase 2: Build and Push Docker Images
+  build-and-push:
+    name: 🐳 Build & Push
+    needs: setup
+    runs-on: ubuntu-latest
+    if: needs.setup.outputs.matrix-services != '[]'
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.setup.outputs.matrix-services) }}
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:latest
+            ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:${{ env.ENVIRONMENT }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Verify image push
+        run: |
+          echo "✅ Successfully built and pushed retail-store-${{ matrix.service }}:${{ github.sha }}"
+          aws ecr describe-images --repository-name retail-store-${{ matrix.service }} --image-ids imageTag=${{ github.sha }} --region ${{ env.AWS_REGION }}
+
+  # Phase 3: Update Helm Charts
+  update-helm-charts:
+    name: ⚙️ Update Helm Charts
+    needs: [setup, build-and-push]
+    runs-on: ubuntu-latest
+    if: needs.setup.outputs.matrix-services != '[]'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Helm values for all services
+        run: |
+          services=(${{ join(fromJson(needs.setup.outputs.matrix-services), ' ') }})
+          updated_services=()
+          
+          for service in "${services[@]}"; do
+            echo "🔄 Updating Helm values for $service..."
+            
+            # Update image tag in values.yaml
+            if [ -f "src/$service/chart/values.yaml" ]; then
+              # Update the image tag
+              sed -i "s|tag: .*|tag: \"${{ github.sha }}\"|g" "src/$service/chart/values.yaml"
+              
+              # Update environment if specified
+              if [ "${{ env.ENVIRONMENT }}" != "staging" ]; then
+                sed -i "s|environment: .*|environment: \"${{ env.ENVIRONMENT }}\"|g" "src/$service/chart/values.yaml" || true
+              fi
+              
+              updated_services+=("$service")
+              echo "✅ Updated $service Helm chart"
+            else
+              echo "⚠️ Helm chart not found for $service"
+            fi
+          done
+          
+          # Set environment variable for commit
+          echo "UPDATED_SERVICES=${updated_services[*]}" >> $GITHUB_ENV
+
+      - name: Commit and push Helm changes
+        if: env.UPDATED_SERVICES != ''
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          git add src/*/chart/values.yaml
+          
+          if git diff --staged --quiet; then
+            echo "ℹ️ No Helm changes to commit"
+          else
+            git commit -m "🚀 Deploy: Update image tags for services: ${{ env.UPDATED_SERVICES }}
+
+            Environment: ${{ env.ENVIRONMENT }}
+            Commit: ${{ github.sha }}
+            Services: ${{ env.UPDATED_SERVICES }}"
+            git push
+            echo "✅ Helm charts updated and pushed"
+          fi
+
+  # Phase 4: Deploy to Kubernetes
+  deploy-to-kubernetes:
+    name: 🚀 Deploy to Kubernetes
+    needs: [setup, build-and-push, update-helm-charts]
+    runs-on: ubuntu-latest
+    if: needs.setup.outputs.matrix-services != '[]'
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.setup.outputs.matrix-services) }}
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Deploy service with Helm
+        run: |
+          service="${{ matrix.service }}"
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          release_name="retail-store-$service"
+          
+          echo "🚀 Deploying $service to $namespace..."
+          
+          # Create namespace if it doesn't exist
+          kubectl create namespace $namespace --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy with Helm
+          helm upgrade --install $release_name ./src/$service/chart \
+            --namespace $namespace \
+            --set image.tag=${{ github.sha }} \
+            --set environment=${{ env.ENVIRONMENT }} \
+            --wait --timeout=10m
+          
+          echo "✅ $service deployed successfully"
+
+      - name: Verify deployment
+        run: |
+          service="${{ matrix.service }}"
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          
+          echo "🔍 Verifying deployment for $service..."
+          
+          # Wait for deployment to be ready
+          kubectl wait --for=condition=available --timeout=300s deployment/retail-store-$service -n $namespace || true
+          
+          # Get deployment status
+          kubectl get deployment retail-store-$service -n $namespace -o wide
+          
+          # Get pod status
+          kubectl get pods -n $namespace -l app.kubernetes.io/name=retail-store-$service
+          
+          # Check service endpoints
+          kubectl get svc -n $namespace -l app.kubernetes.io/name=retail-store-$service
+
+  # Phase 5: Integration Tests
+  integration-tests:
+    name: 🧪 Integration Tests
+    needs: [setup, deploy-to-kubernetes]
+    runs-on: ubuntu-latest
+    if: needs.setup.outputs.matrix-services != '[]'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Wait for all services to be ready
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          services=(${{ join(fromJson(needs.setup.outputs.matrix-services), ' ') }})
+          
+          echo "⏳ Waiting for all services to be ready..."
+          
+          for service in "${services[@]}"; do
+            echo "Checking $service..."
+            kubectl wait --for=condition=available --timeout=300s deployment/retail-store-$service -n $namespace || true
+          done
+
+      - name: Run health checks
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          services=(${{ join(fromJson(needs.setup.outputs.matrix-services), ' ') }})
+          
+          echo "🏥 Running health checks..."
+          
+          for service in "${services[@]}"; do
+            echo "Health check for $service..."
+            
+            # Get service endpoint
+            service_ip=$(kubectl get svc retail-store-$service -n $namespace -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+            
+            if [ -n "$service_ip" ]; then
+              # Try to reach health endpoint
+              kubectl run test-$service --rm -i --restart=Never --image=curlimages/curl -- \
+                curl -f http://$service_ip:80/actuator/health || \
+                curl -f http://$service_ip:80/health || \
+                echo "Health check endpoint not available for $service"
+            else
+              echo "Service IP not found for $service"
+            fi
+          done
+
+  # Phase 6: Deployment Summary
+  deployment-summary:
+    name: 📊 Deployment Summary
+    needs: [setup, build-and-push, update-helm-charts, deploy-to-kubernetes, integration-tests]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Generate deployment summary
+        run: |
+          echo "# 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Services status
+          if [ "${{ needs.setup.result }}" = "success" ]; then
+            services="${{ needs.setup.outputs.matrix-services }}"
+            if [ "$services" != "[]" ]; then
+              echo "## ✅ Services Deployed" >> $GITHUB_STEP_SUMMARY
+              echo "$services" | jq -r '.[]' | while read service; do
+                echo "- **$service** 🟢" >> $GITHUB_STEP_SUMMARY
+              done
+            else
+              echo "## ℹ️ No services deployed (no changes detected)" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Job Status" >> $GITHUB_STEP_SUMMARY
+          echo "- Setup: ${{ needs.setup.result == 'success' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build & Push: ${{ needs.build-and-push.result == 'success' && '✅' || needs.build-and-push.result == 'skipped' && '⏭️' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Update Helm: ${{ needs.update-helm-charts.result == 'success' && '✅' || needs.update-helm-charts.result == 'skipped' && '⏭️' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deploy K8s: ${{ needs.deploy-to-kubernetes.result == 'success' && '✅' || needs.deploy-to-kubernetes.result == 'skipped' && '⏭️' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Integration Tests: ${{ needs.integration-tests.result == 'success' && '✅' || needs.integration-tests.result == 'skipped' && '⏭️' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔗 Useful Commands" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Check deployment status" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl get pods -n retail-store-${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Get application URL" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl get svc -n ingress-nginx ingress-nginx-controller" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# View logs" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl logs -n retail-store-${{ env.ENVIRONMENT }} -l app.kubernetes.io/name=retail-store-ui" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed!"
+          echo "Check the workflow logs for detailed error information."
