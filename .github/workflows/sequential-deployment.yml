@@ -1,0 +1,474 @@
+name: Sequential Service Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      start_from:
+        description: 'Start deployment from service'
+        required: true
+        default: 'ui'
+        type: choice
+        options:
+        - ui
+        - catalog
+        - orders
+        - checkout
+        - cart
+        - app
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'staging' }}
+
+jobs:
+  # Phase 1: Deploy UI Service
+  deploy-ui:
+    name: 🎨 Deploy UI Service
+    runs-on: ubuntu-latest
+    if: |
+      github.event.inputs.start_from == 'ui' ||
+      github.event.inputs.start_from == 'catalog' ||
+      github.event.inputs.start_from == 'orders' ||
+      github.event.inputs.start_from == 'checkout' ||
+      github.event.inputs.start_from == 'cart' ||
+      github.event.inputs.start_from == 'app'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push UI Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/ui
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/retail-store-ui:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/retail-store-ui:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update UI Helm values
+        run: |
+          echo "🔄 Updating UI Helm values..."
+          sed -i "s|tag: .*|tag: \"${{ github.sha }}\"|g" "src/ui/chart/values.yaml"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Deploy UI service
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl create namespace $namespace --dry-run=client -o yaml | kubectl apply -f -
+          
+          helm upgrade --install retail-store-ui ./src/ui/chart \
+            --namespace $namespace \
+            --set image.tag=${{ github.sha }} \
+            --wait --timeout=10m
+
+      - name: Verify UI deployment
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl wait --for=condition=available --timeout=300s deployment/retail-store-ui -n $namespace
+          kubectl get pods -n $namespace -l app.kubernetes.io/name=retail-store-ui
+
+  # Phase 2: Deploy Catalog Service
+  deploy-catalog:
+    name: 📚 Deploy Catalog Service
+    runs-on: ubuntu-latest
+    needs: deploy-ui
+    if: |
+      github.event.inputs.start_from == 'catalog' ||
+      github.event.inputs.start_from == 'orders' ||
+      github.event.inputs.start_from == 'checkout' ||
+      github.event.inputs.start_from == 'cart' ||
+      github.event.inputs.start_from == 'app' ||
+      (needs.deploy-ui.result == 'success' && github.event.inputs.start_from == 'ui')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Catalog Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/catalog
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/retail-store-catalog:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/retail-store-catalog:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Catalog Helm values
+        run: |
+          echo "🔄 Updating Catalog Helm values..."
+          sed -i "s|tag: .*|tag: \"${{ github.sha }}\"|g" "src/catalog/chart/values.yaml"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Deploy Catalog service
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl create namespace $namespace --dry-run=client -o yaml | kubectl apply -f -
+          
+          helm upgrade --install retail-store-catalog ./src/catalog/chart \
+            --namespace $namespace \
+            --set image.tag=${{ github.sha }} \
+            --wait --timeout=10m
+
+      - name: Verify Catalog deployment
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl wait --for=condition=available --timeout=300s deployment/retail-store-catalog -n $namespace
+          kubectl get pods -n $namespace -l app.kubernetes.io/name=retail-store-catalog
+
+  # Phase 3: Deploy Orders Service
+  deploy-orders:
+    name: 📦 Deploy Orders Service
+    runs-on: ubuntu-latest
+    needs: deploy-catalog
+    if: |
+      github.event.inputs.start_from == 'orders' ||
+      github.event.inputs.start_from == 'checkout' ||
+      github.event.inputs.start_from == 'cart' ||
+      github.event.inputs.start_from == 'app' ||
+      (needs.deploy-catalog.result == 'success')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Orders Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/orders
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/retail-store-orders:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/retail-store-orders:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Orders Helm values
+        run: |
+          echo "🔄 Updating Orders Helm values..."
+          sed -i "s|tag: .*|tag: \"${{ github.sha }}\"|g" "src/orders/chart/values.yaml"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Deploy Orders service
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl create namespace $namespace --dry-run=client -o yaml | kubectl apply -f -
+          
+          helm upgrade --install retail-store-orders ./src/orders/chart \
+            --namespace $namespace \
+            --set image.tag=${{ github.sha }} \
+            --wait --timeout=10m
+
+      - name: Verify Orders deployment
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl wait --for=condition=available --timeout=300s deployment/retail-store-orders -n $namespace
+          kubectl get pods -n $namespace -l app.kubernetes.io/name=retail-store-orders
+
+  # Phase 4: Deploy Checkout Service
+  deploy-checkout:
+    name: 💳 Deploy Checkout Service
+    runs-on: ubuntu-latest
+    needs: deploy-orders
+    if: |
+      github.event.inputs.start_from == 'checkout' ||
+      github.event.inputs.start_from == 'cart' ||
+      github.event.inputs.start_from == 'app' ||
+      (needs.deploy-orders.result == 'success')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Checkout Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/checkout
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/retail-store-checkout:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/retail-store-checkout:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Checkout Helm values
+        run: |
+          echo "🔄 Updating Checkout Helm values..."
+          sed -i "s|tag: .*|tag: \"${{ github.sha }}\"|g" "src/checkout/chart/values.yaml"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Deploy Checkout service
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl create namespace $namespace --dry-run=client -o yaml | kubectl apply -f -
+          
+          helm upgrade --install retail-store-checkout ./src/checkout/chart \
+            --namespace $namespace \
+            --set image.tag=${{ github.sha }} \
+            --wait --timeout=10m
+
+      - name: Verify Checkout deployment
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl wait --for=condition=available --timeout=300s deployment/retail-store-checkout -n $namespace
+          kubectl get pods -n $namespace -l app.kubernetes.io/name=retail-store-checkout
+
+  # Phase 5: Deploy Cart Service
+  deploy-cart:
+    name: 🛒 Deploy Cart Service
+    runs-on: ubuntu-latest
+    needs: deploy-checkout
+    if: |
+      github.event.inputs.start_from == 'cart' ||
+      github.event.inputs.start_from == 'app' ||
+      (needs.deploy-checkout.result == 'success')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Cart Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/cart
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/retail-store-cart:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/retail-store-cart:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Cart Helm values
+        run: |
+          echo "🔄 Updating Cart Helm values..."
+          sed -i "s|tag: .*|tag: \"${{ github.sha }}\"|g" "src/cart/chart/values.yaml"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Deploy Cart service
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl create namespace $namespace --dry-run=client -o yaml | kubectl apply -f -
+          
+          helm upgrade --install retail-store-cart ./src/cart/chart \
+            --namespace $namespace \
+            --set image.tag=${{ github.sha }} \
+            --wait --timeout=10m
+
+      - name: Verify Cart deployment
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl wait --for=condition=available --timeout=300s deployment/retail-store-cart -n $namespace
+          kubectl get pods -n $namespace -l app.kubernetes.io/name=retail-store-cart
+
+  # Phase 6: Deploy App Service
+  deploy-app:
+    name: 🚀 Deploy App Service
+    runs-on: ubuntu-latest
+    needs: deploy-cart
+    if: |
+      github.event.inputs.start_from == 'app' ||
+      (needs.deploy-cart.result == 'success')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push App Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/app
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/retail-store-app:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/retail-store-app:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update App Helm values
+        run: |
+          echo "🔄 Updating App Helm values..."
+          sed -i "s|tag: .*|tag: \"${{ github.sha }}\"|g" "src/app/chart/values.yaml"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Deploy App service
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl create namespace $namespace --dry-run=client -o yaml | kubectl apply -f -
+          
+          helm upgrade --install retail-store-app ./src/app/chart \
+            --namespace $namespace \
+            --set image.tag=${{ github.sha }} \
+            --wait --timeout=10m
+
+      - name: Verify App deployment
+        run: |
+          namespace="retail-store-${{ env.ENVIRONMENT }}"
+          kubectl wait --for=condition=available --timeout=300s deployment/retail-store-app -n $namespace
+          kubectl get pods -n $namespace -l app.kubernetes.io/name=retail-store-app
+
+  # Final Summary
+  deployment-summary:
+    name: 📊 Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy-ui, deploy-catalog, deploy-orders, deploy-checkout, deploy-cart, deploy-app]
+    if: always()
+    steps:
+      - name: Generate deployment summary
+        run: |
+          echo "# 🚀 Sequential Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Started from:** ${{ github.event.inputs.start_from }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📋 Service Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "- 🎨 UI: ${{ needs.deploy-ui.result == 'success' && '✅ Success' || needs.deploy-ui.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 📚 Catalog: ${{ needs.deploy-catalog.result == 'success' && '✅ Success' || needs.deploy-catalog.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 Orders: ${{ needs.deploy-orders.result == 'success' && '✅ Success' || needs.deploy-orders.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 💳 Checkout: ${{ needs.deploy-checkout.result == 'success' && '✅ Success' || needs.deploy-checkout.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🛒 Cart: ${{ needs.deploy-cart.result == 'success' && '✅ Success' || needs.deploy-cart.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🚀 App: ${{ needs.deploy-app.result == 'success' && '✅ Success' || needs.deploy-app.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔗 Useful Commands" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Check all deployments" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl get pods -n retail-store-${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Get application URL" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl get svc -n ingress-nginx ingress-nginx-controller" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
