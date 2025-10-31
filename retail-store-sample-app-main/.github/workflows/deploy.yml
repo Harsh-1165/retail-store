@@ -1,0 +1,176 @@
+name: Deploy
+
+on:
+  push:
+    branches: [gitops]
+    paths: ['src/**']
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      ui: ${{ steps.changes.outputs.ui }}
+      catalog: ${{ steps.changes.outputs.catalog }}
+      orders: ${{ steps.changes.outputs.orders }}
+      checkout: ${{ steps.changes.outputs.checkout }}
+      cart: ${{ steps.changes.outputs.cart }}
+      app: ${{ steps.changes.outputs.app }}
+      any_changed: ${{ steps.changes.outputs.changes }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect service changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            ui:
+              - 'src/ui/**'
+            catalog:
+              - 'src/catalog/**'
+            orders:
+              - 'src/orders/**'
+            checkout:
+              - 'src/checkout/**'
+            cart:
+              - 'src/cart/**'
+            app:
+              - 'src/app/**'
+            changes:
+              - 'src/**'
+
+  deploy:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: needs.detect-changes.outputs.any_changed == 'true'
+    strategy:
+      matrix:
+        service: [ui, catalog, orders, checkout, cart, app]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check if service changed
+        id: service-changed
+        run: |
+          service="${{ matrix.service }}"
+          changed="${{ needs.detect-changes.outputs[matrix.service] }}"
+          echo "Service: $service, Changed: $changed"
+          echo "changed=$changed" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        if: steps.service-changed.outputs.changed == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        if: steps.service-changed.outputs.changed == 'true'
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Install ArgoCD CLI
+        if: steps.service-changed.outputs.changed == 'true'
+        run: |
+          curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+          rm argocd-linux-amd64
+
+      - name: Login to ArgoCD
+        if: steps.service-changed.outputs.changed == 'true'
+        run: |
+          # Get ArgoCD server endpoint
+          ARGOCD_SERVER=$(kubectl get svc argocd-server -n argocd -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          
+          # Login to ArgoCD
+          argocd login $ARGOCD_SERVER --username admin --password ${{ secrets.ARGOCD_PASSWORD }} --insecure
+
+      - name: Sync ArgoCD application
+        if: steps.service-changed.outputs.changed == 'true'
+        run: |
+          service="${{ matrix.service }}"
+          app_name="retail-store-$service"
+          
+          echo "Syncing ArgoCD application: $app_name"
+          
+          # Check if application exists
+          if argocd app get $app_name > /dev/null 2>&1; then
+            echo "Application $app_name exists, syncing..."
+            argocd app sync $app_name --prune
+            argocd app wait $app_name --timeout 300
+          else
+            echo "Application $app_name does not exist, skipping..."
+          fi
+
+      - name: Verify deployment
+        if: steps.service-changed.outputs.changed == 'true'
+        run: |
+          service="${{ matrix.service }}"
+          namespace="retail-store"
+          
+          echo "Verifying deployment for service: $service"
+          
+          # Wait for deployment to be ready
+          kubectl wait --for=condition=available --timeout=300s deployment/retail-store-$service -n $namespace || true
+          
+          # Get deployment status
+          kubectl get deployment retail-store-$service -n $namespace -o wide || echo "Deployment not found"
+          
+          # Get pod status
+          kubectl get pods -n $namespace -l app.kubernetes.io/name=retail-store-$service || echo "No pods found"
+
+  summary:
+    needs: [detect-changes, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Deployment Summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          services=("ui" "catalog" "orders" "checkout" "cart" "app")
+          deployed_services=()
+          
+          for service in "${services[@]}"; do
+            if [ "${{ needs.detect-changes.outputs[service] }}" == "true" ]; then
+              deployed_services+=("$service")
+            fi
+          done
+          
+          if [ ${#deployed_services[@]} -gt 0 ]; then
+            echo "### ✅ Services Deployed:" >> $GITHUB_STEP_SUMMARY
+            for service in "${deployed_services[@]}"; do
+              echo "- **$service**" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "### ℹ️ No services were deployed (no changes detected)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Useful Commands:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Check application status" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl get pods -n retail-store" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Check ArgoCD applications" >> $GITHUB_STEP_SUMMARY
+          echo "argocd app list" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Get application URL" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl get svc -n ingress-nginx ingress-nginx-controller" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify deployment status
+        if: failure()
+        run: |
+          echo "❌ Deployment failed for one or more services"
+          echo "Check the workflow logs for details"
