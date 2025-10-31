@@ -1,0 +1,84 @@
+name: Simple Sequential Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Which service to deploy'
+        required: true
+        type: choice
+        options:
+        - ui
+        - catalog
+        - orders
+        - checkout
+        - cart
+        - app
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+
+jobs:
+  deploy-single-service:
+    name: Deploy ${{ github.event.inputs.service }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Test AWS credentials
+        run: |
+          echo "Testing AWS credentials..."
+          if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+            echo "❌ AWS_ACCESS_KEY_ID is missing"
+            exit 1
+          fi
+          if [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+            echo "❌ AWS_SECRET_ACCESS_KEY is missing"
+            exit 1
+          fi
+          if [ -z "${{ secrets.ECR_REGISTRY }}" ]; then
+            echo "❌ ECR_REGISTRY is missing"
+            exit 1
+          fi
+          echo "✅ All secrets are configured"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Test AWS connection
+        run: |
+          echo "Testing AWS connection..."
+          aws sts get-caller-identity
+          echo "✅ AWS connection successful"
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Test ECR access
+        run: |
+          echo "Testing ECR access..."
+          aws ecr describe-repositories --repository-names retail-store-${{ github.event.inputs.service }} --region ${{ env.AWS_REGION }}
+          echo "✅ ECR access successful"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/${{ github.event.inputs.service }}
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/retail-store-${{ github.event.inputs.service }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/retail-store-${{ github.event.inputs.service }}:latest
+
+      - name: Deployment complete
+        run: |
+          echo "✅ Successfully deployed ${{ github.event.inputs.service }}"
+          echo "Image: ${{ env.ECR_REGISTRY }}/retail-store-${{ github.event.inputs.service }}:${{ github.sha }}"
